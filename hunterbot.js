@@ -1,12 +1,13 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
+import http from 'http';
 
 // ============================================
 // CONFIGURACIÓN DE CLIENTES
 // ============================================
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false }); // polling: false para control manual
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
 
 const birdeyeClient = axios.create({
     baseURL: 'https://public-api.birdeye.so',
@@ -14,28 +15,27 @@ const birdeyeClient = axios.create({
         'x-chain': 'solana',
         'x-api-key': process.env.BIRDEYE_API_KEY
     },
-    timeout: 10000
+    timeout: 15000
 });
 
 const dexscreenerClient = axios.create({
     baseURL: 'https://api.dexscreener.com',
-    timeout: 10000
+    timeout: 15000
 });
 
 const rugCheckClient = axios.create({
     baseURL: 'https://api.rugcheck.xyz/v1',
-    timeout: 10000
+    timeout: 15000
 });
 
 // ============================================
-// ESTADO DEL BOT Y CONTROL DE RECONEXIÓN
+// ESTADO DEL BOT
 // ============================================
 
 const seenTokens = new Set();
 let consecutiveErrors = 0;
 let isPollingRunning = false;
 let reconnectAttempts = 0;
-let scanInterval = null;
 let isReconnecting = false;
 
 const apiStatus = {
@@ -44,7 +44,32 @@ const apiStatus = {
 };
 
 // ============================================
-// FUNCIÓN DE AUTORECONEXIÓN DEL BOT
+// SERVIDOR HTTP PARA RENDER (mantiene activo)
+// ============================================
+
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+    if (req.url === '/health' || req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+            status: 'online', 
+            timestamp: new Date().toISOString(),
+            polling: isPollingRunning,
+            uptime: process.uptime()
+        }));
+    } else {
+        res.writeHead(404);
+        res.end();
+    }
+});
+
+server.listen(PORT, () => {
+    console.log(`✅ Servidor HTTP escuchando en puerto ${PORT}`);
+    console.log(`   Health check: http://localhost:${PORT}/health`);
+});
+
+// ============================================
+// FUNCIÓN DE AUTORECONEXIÓN
 // ============================================
 
 async function startBotWithRetry() {
@@ -58,37 +83,44 @@ async function startBotWithRetry() {
     try {
         console.log(`\n🚀 Intentando iniciar bot (intento ${reconnectAttempts + 1})...`);
         
-        // Detener polling si está corriendo
         if (isPollingRunning) {
             console.log('🛑 Deteniendo polling anterior...');
             try {
                 await bot.stopPolling();
             } catch (e) {
-                // Ignorar errores al detener
+                // Ignorar
             }
             isPollingRunning = false;
         }
         
-        // Iniciar polling con opciones robustas
         await bot.startPolling({
-            timeout: 30,           // Timeout más corto para detectar fallos rápido
-            retryTimeout: 5000,    // Reintentar cada 5 segundos internamente
-            restart: true          // Intentar reinicio automático interno
+            timeout: 30,
+            retryTimeout: 5000,
+            restart: true
         });
         
         isPollingRunning = true;
-        reconnectAttempts = 0;     // Resetear contador en éxito
+        reconnectAttempts = 0;
         isReconnecting = false;
         
         console.log('✅ Bot conectado exitosamente a Telegram');
-        console.log('📡 Monitoreando conexión en tiempo real...\n');
+        console.log('📡 Monitoreando conexión en tiempo real...');
+        
+        // Notificar que el bot está online
+        try {
+            await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, 
+                '🟢 *HunterNode está en línea!*\n\nBot reiniciado y funcionando correctamente.', 
+                { parse_mode: 'Markdown' }
+            );
+        } catch (e) {
+            console.log('⚠️ No se pudo enviar mensaje de inicio (puede ser normal)');
+        }
         
     } catch (error) {
         isPollingRunning = false;
         isReconnecting = false;
         console.error(`❌ Error iniciando bot: ${error.message}`);
         
-        // Reintentar con backoff exponencial (máximo 30 segundos)
         reconnectAttempts++;
         const delay = Math.min(30000, Math.pow(2, reconnectAttempts) * 1000);
         console.log(`⏳ Reintentando conexión en ${delay/1000} segundos...`);
@@ -104,10 +136,9 @@ async function startBotWithRetry() {
 bot.on('polling_error', async (error) => {
     console.error(`❌ [Polling Error] ${error.message}`);
     
-    // Errores recuperables que requieren reconexión
     const recoverableErrors = [
         'ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'getaddrinfo', 
-        'timeout', 'ECONNREFUSED', 'EPIPE', 'EAI_AGAIN'
+        'timeout', 'ECONNREFUSED', 'EPIPE', 'EAI_AGAIN', '403'
     ];
     
     const shouldReconnect = recoverableErrors.some(err => 
@@ -117,11 +148,7 @@ bot.on('polling_error', async (error) => {
     if (shouldReconnect && !isReconnecting) {
         console.log('🌐 Error de red detectado, iniciando reconexión automática...');
         isPollingRunning = false;
-        
-        // Pequeño delay antes de reconectar
-        setTimeout(() => {
-            startBotWithRetry();
-        }, 3000);
+        setTimeout(() => startBotWithRetry(), 3000);
     }
 });
 
@@ -130,7 +157,7 @@ bot.on('webhook_error', (error) => {
 });
 
 // ============================================
-// VERIFICACIÓN DE SEGURIDAD (MODO ESTRICTO)
+// VERIFICACIÓN DE SEGURIDAD
 // ============================================
 
 async function verifyTokenSecurity(tokenAddress) {
@@ -138,7 +165,6 @@ async function verifyTokenSecurity(tokenAddress) {
         const response = await rugCheckClient.get(`/tokens/${tokenAddress}/report/summary`);
         const report = response.data;
         
-        // Si no hay datos, RECHAZAR el token
         if (!report || report.score === undefined) {
             console.log(`❌ ${tokenAddress.slice(0,8)}: Sin datos en RugCheck - RECHAZADO`);
             return {
@@ -160,14 +186,13 @@ async function verifyTokenSecurity(tokenAddress) {
         const isHoneypot = report.honeypotRisk === true;
         const holderConcentration = report.top10HolderPercent || 0;
         
-        // FILTROS ESTRICTOS
         const isSafe = !isHoneypot && 
                        hasLockedLiquidity && 
                        freezeAuthorityDisabled && 
                        mintAuthorityDisabled &&
                        holderConcentration < 30;
         
-        console.log(`🔒 ${tokenAddress.slice(0,8)}: ${isSafe ? '✅ APROBADO' : '❌ RECHAZADO'} | Holders: ${holderConcentration}% | Honeypot: ${isHoneypot} | Liquidez bloqueada: ${hasLockedLiquidity}`);
+        console.log(`🔒 ${tokenAddress.slice(0,8)}: ${isSafe ? '✅ APROBADO' : '❌ RECHAZADO'} | Holders: ${holderConcentration}%`);
         
         return {
             isSafe,
@@ -176,8 +201,7 @@ async function verifyTokenSecurity(tokenAddress) {
                 freezeAuthorityDisabled: freezeAuthorityDisabled ? '✅ Sí' : '❌ No',
                 mintAuthorityDisabled: mintAuthorityDisabled ? '✅ Sí' : '❌ No',
                 isHoneypot,
-                holderConcentration: holderConcentration.toFixed(1),
-                securityScore: report.score || 0
+                holderConcentration: holderConcentration.toFixed(1)
             }
         };
         
@@ -269,20 +293,6 @@ async function fetchTokensFromDexScreener() {
                         });
                         console.log(`  ✅ ${profile.symbol} - $${parseFloat(pair.priceUsd || 0).toFixed(6)}`);
                     }
-                } else {
-                    tokensWithData.push({
-                        address: profile.tokenAddress,
-                        symbol: profile.symbol || 'UNKNOWN',
-                        name: profile.name || 'Unknown',
-                        price: 0,
-                        price_change_1h_percent: 0,
-                        liquidity: 0,
-                        volume_24h_usd: 0,
-                        volume_buy_24h_usd: 0,
-                        volume_sell_24h_usd: 0,
-                        market_cap: 0
-                    });
-                    console.log(`  ⚠️ ${profile.symbol} - Sin datos de trading`);
                 }
                 
                 await new Promise(resolve => setTimeout(resolve, 300));
@@ -293,7 +303,7 @@ async function fetchTokensFromDexScreener() {
         }
         
         const validTokens = tokensWithData.filter(t => t.liquidity > 20000);
-        console.log(`✅ DexScreener: ${validTokens.length} tokens válidos (liquidez > $20k)`);
+        console.log(`✅ DexScreener: ${validTokens.length} tokens válidos`);
         return validTokens;
         
     } catch (error) {
@@ -303,7 +313,7 @@ async function fetchTokensFromDexScreener() {
 }
 
 // ============================================
-// FALLBACK BIRDEYE → DEXSCREENER
+// FALLBACK
 // ============================================
 
 async function fetchTokensWithFallback() {
@@ -355,14 +365,13 @@ async function fetchTokensWithFallback() {
 // ============================================
 
 async function scanMemecoins() {
-    // Verificar que el bot esté conectado antes de escanear
     if (!isPollingRunning) {
         console.log('⏳ Bot no conectado a Telegram, omitiendo escaneo...');
         return;
     }
     
     console.log("\n" + "=".repeat(50));
-    console.log(`🔍 ESCANEO #${consecutiveErrors + 1} - ${new Date().toLocaleTimeString()}`);
+    console.log(`🔍 ESCANEO - ${new Date().toLocaleTimeString()}`);
     console.log("=".repeat(50));
     
     const { source, tokens } = await fetchTokensWithFallback();
@@ -372,11 +381,9 @@ async function scanMemecoins() {
         return;
     }
     
-    console.log(`📊 Fuente: ${source.toUpperCase()} | ${tokens.length} tokens a analizar`);
+    console.log(`📊 Fuente: ${source.toUpperCase()} | ${tokens.length} tokens`);
     
     let alertsSent = 0;
-    let analyzedCount = 0;
-    let securityPassCount = 0;
     
     for (const token of tokens) {
         if (seenTokens.has(token.address)) continue;
@@ -395,33 +402,18 @@ async function scanMemecoins() {
         
         if (!hasMinimumLiquidity || !isMemeCap || !isVolatile || !buyingPressure) continue;
         
-        analyzedCount++;
-        console.log(`\n🔎 Analizando ${token.symbol} (${token.address.slice(0,8)}...)`);
-        console.log(`   💧 Liquidez: $${Math.floor(token.liquidity).toLocaleString()}`);
-        console.log(`   📊 Volumen: $${Math.floor(token.volume_24h_usd).toLocaleString()}`);
-        console.log(`   📈 Cambio 1h: ${token.price_change_1h_percent > 0 ? '+' : ''}${token.price_change_1h_percent.toFixed(2)}%`);
+        console.log(`🔎 Analizando ${token.symbol}...`);
         
         const security = await verifyTokenSecurity(token.address);
         
-        if (!security.isSafe) {
-            console.log(`❌ ${token.symbol} - RECHAZADO por seguridad`);
-            continue;
-        }
-        
-        securityPassCount++;
+        if (!security.isSafe) continue;
         
         seenTokens.add(token.address);
         setTimeout(() => seenTokens.delete(token.address), 3600000);
         
-        const sourceNote = source === 'dexscreener' && apiStatus.birdeye.status !== 'active' 
-            ? "\n⚠️ *Nota:* Datos vía DexScreener (Birdeye no disponible temporalmente)" 
-            : "";
-        
-        const priceChangeEmoji = token.price_change_1h_percent > 0 ? "📈" : "📉";
-        
-        const messageText = `🔥 *HunterNode: Alerta de Alta Calidad*${sourceNote}
+        const messageText = `🔥 *HunterNode: Alerta de Alta Calidad*
 
-${priceChangeEmoji} *${token.symbol}* (${token.name})
+📈 *${token.symbol}* (${token.name})
 
 💰 *Precio:* $${token.price > 0 ? token.price.toFixed(8) : 'N/A'}
 📊 *Cambio 1h:* ${token.price_change_1h_percent > 0 ? '+' : ''}${token.price_change_1h_percent.toFixed(2)}%
@@ -435,18 +427,11 @@ ${priceChangeEmoji} *${token.symbol}* (${token.name})
 💰 *Mercado:*
 • Liquidez: $${Math.floor(token.liquidity).toLocaleString()}
 • Volumen 24h: $${Math.floor(token.volume_24h_usd).toLocaleString()}
-• Market Cap: $${Math.floor(token.market_cap).toLocaleString()}
 
 📑 *Contrato:*
 \`${token.address}\`
 
-🔗 *Enlaces:*
-[📊 DexScreener](https://dexscreener.com/solana/${token.address}) | 
-[🔍 RugCheck](https://rugcheck.xyz/tokens/${token.address}) | 
-[🟢 Birdeye](https://birdeye.so/token/${token.address}?chain=solana)
-
----
-⚠️ *NFA - Siempre haz tu propia investigación antes de invertir*`;
+🔗 [DexScreener](https://dexscreener.com/solana/${token.address}) | [RugCheck](https://rugcheck.xyz/tokens/${token.address}) | [Birdeye](https://birdeye.so/token/${token.address}?chain=solana)`;
         
         try {
             await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, messageText, {
@@ -459,34 +444,23 @@ ${priceChangeEmoji} *${token.symbol}* (${token.name})
                         ],
                         [
                             { text: "🟢 Birdeye", url: `https://birdeye.so/token/${token.address}?chain=solana` },
-                            { text: "🟣 Jupiter (Comprar)", url: `https://jup.ag/swap/SOL-${token.address}` }
+                            { text: "🟣 Jupiter", url: `https://jup.ag/swap/SOL-${token.address}` }
                         ]
                     ]
                 }
             });
             
             alertsSent++;
-            console.log(`\n✅✅✅ ALERTA ENVIADA: ${token.symbol} ✅✅✅`);
+            console.log(`✅ ALERTA ENVIADA: ${token.symbol}`);
             
         } catch (error) {
-            console.error(`❌ Error enviando alerta para ${token.symbol}: ${error.message}`);
-            // Si hay error de conexión al enviar, marcar para reconectar
-            if (error.message?.includes('polling') || error.message?.includes('ECONN')) {
-                console.log('⚠️ Error de conexión detectado, reiniciando polling...');
-                isPollingRunning = false;
-                startBotWithRetry();
-            }
+            console.error(`❌ Error enviando alerta: ${error.message}`);
         }
         
         await new Promise(resolve => setTimeout(resolve, 2000));
     }
     
-    console.log("\n" + "-".repeat(50));
-    console.log(`📊 RESUMEN DEL ESCANEO:`);
-    console.log(`   • Analizados: ${analyzedCount}`);
-    console.log(`   • Pasaron seguridad: ${securityPassCount}`);
-    console.log(`   • Alertas enviadas: ${alertsSent}`);
-    console.log("-".repeat(50));
+    console.log(`📊 Alertas enviadas: ${alertsSent}`);
 }
 
 // ============================================
@@ -495,98 +469,27 @@ ${priceChangeEmoji} *${token.symbol}* (${token.name})
 
 bot.onText(/\/start/, async (msg) => {
     await bot.sendMessage(msg.chat.id,
-        `🤖 *HunterNode Activado - Modo Estricto*
+        `🤖 *HunterNode Activado*
 
-🔐 *Filtros activos:*
-• ✅ Liquidez mínima: $20,000
-• ✅ Market Cap: $5k - $50M
-• ✅ Volatilidad mínima: 5%
-• ✅ Presión compradora: +20%
-• ✅ Anti-honeypot
-• ✅ Liquidez bloqueada (requerido)
-• ✅ Freeze authority deshabilitada
-• ✅ Mint authority deshabilitada
-• ✅ Top 10 holders < 30%
-• ✅ RugCheck con datos (requerido)
-
-🔌 *Sistema de autoreconexión:* ✅ Activo
-📡 *APIs:* Birdeye → DexScreener (fallback)
-
+🔐 *Filtros:* Liquidez >$20k | Market Cap $5k-$50M | Holders <30% | Anti-honeypot
 🔄 *Escaneo:* Cada 2 minutos
+📡 *Estado:* ${isPollingRunning ? '✅ Conectado' : '⚠️ Conectando'}
 
-💡 *Comandos:*
-/status - Ver estado del bot
-/help - Ayuda
-
-⚠️ *Recuerda:* Este bot solo alerta. Siempre haz tu propia investigación.`,
+/status - Ver estado detallado`,
         { parse_mode: 'Markdown' }
     );
 });
 
 bot.onText(/\/status/, async (msg) => {
-    const birdeyeStatus = apiStatus.birdeye.status === 'active' 
-        ? '✅ Activo' 
-        : apiStatus.birdeye.retryAfter 
-            ? `⏳ Cooldown (${Math.ceil((apiStatus.birdeye.retryAfter - Date.now()) / 60000)} min restantes)`
-            : '❌ Fallo';
-    
     await bot.sendMessage(msg.chat.id,
-        `📊 *Estado del HunterNode*
+        `📊 *Estado del Bot*
 
-🔌 *APIs:*
-• Birdeye: ${birdeyeStatus}
-• DexScreener: ${apiStatus.dexscreener.status === 'active' ? '✅ Activo' : '⚠️ Problemas'}
-• RugCheck: ✅ Activo
+🔌 *Conexión Telegram:* ${isPollingRunning ? '✅ Activa' : '❌ Desconectada'}
+🔄 *Reintentos:* ${reconnectAttempts}
+📝 *Tokens en memoria:* ${seenTokens.size}
+⏱️ *Tiempo activo:* ${Math.floor(process.uptime())} segundos
 
-📡 *Conexión Telegram:*
-• Polling: ${isPollingRunning ? '✅ Activo' : '❌ Desconectado'}
-• Reintentos: ${reconnectAttempts}
-
-📝 *Estadísticas:*
-• Tokens en memoria: ${seenTokens.size}
-• Errores consecutivos: ${consecutiveErrors}
-
-🎯 *Modo:* Estricto (solo tokens 100% verificados)
-📅 *Último escaneo:* ${new Date().toLocaleTimeString()}`,
-        { parse_mode: 'Markdown' }
-    );
-});
-
-bot.onText(/\/help/, async (msg) => {
-    await bot.sendMessage(msg.chat.id,
-        `🆘 *Ayuda HunterNode*
-
-*¿Qué hace este bot?*
-Analiza tokens de Solana en tiempo real y alerta cuando encuentra oportunidades potenciales.
-
-*¿Qué filtros usa?*
-• Liquidez mínima: $20,000
-• Market Cap: $5k - $50M
-• Volatilidad: >5% en 1h
-• Presión compradora: +20%
-• Anti-honeypot
-• Liquidez bloqueada
-• Freeze/Mint authority deshabilitadas
-• Holders top10 < 30%
-• RugCheck con datos
-
-*Sistema de autoreconexión:*
-• Detecta caídas de internet automáticamente
-• Reintenta conexión con backoff exponencial
-• No requiere reinicio manual
-
-*¿Cómo usar las alertas?*
-1. Recibe la alerta en Telegram
-2. Haz clic en los botones para ver el token
-3. Analiza en DexScreener/RugCheck
-4. Decide si comprar (NFA)
-
-*Comandos:*
-/start - Iniciar bot
-/status - Ver estado
-/help - Esta ayuda
-
-⚠️ *ADVERTENCIA:* Los memecoins son de alto riesgo. Nunca inviertas más de lo que estás dispuesto a perder.`,
+🎯 *Modo:* Estricto (100% verificado)`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -598,73 +501,43 @@ Analiza tokens de Solana en tiempo real y alerta cuando encuentra oportunidades 
 process.on('uncaughtException', (error) => {
     console.error('❌ Error no capturado:', error);
     if (isPollingRunning) {
-        console.log('🔄 Reiniciando bot por error fatal...');
         isPollingRunning = false;
         startBotWithRetry();
     }
 });
 
-process.on('unhandledRejection', (error) => {
-    console.error('❌ Promesa rechazada:', error);
-    // No reiniciamos automáticamente aquí porque puede ser solo una API fallando
-});
-
-// Manejar señales de terminación
 process.on('SIGINT', () => {
-    console.log('\n🛑 Recibida señal SIGINT. Cerrando bot...');
-    if (scanInterval) clearInterval(scanInterval);
-    bot.stopPolling().then(() => process.exit(0));
-});
-
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Recibida señal SIGTERM. Cerrando bot...');
-    if (scanInterval) clearInterval(scanInterval);
+    console.log('\n🛑 Cerrando bot...');
+    server.close();
     bot.stopPolling().then(() => process.exit(0));
 });
 
 // ============================================
-// INICIO DEL BOT
+// INICIO
 // ============================================
 
 console.log("\n" + "=".repeat(50));
 console.log("🚀 HUNTERNODE INICIALIZADO - MODO ESTRICTO");
 console.log("=".repeat(50));
-console.log("✅ Filtros activos:");
-console.log("   • RugCheck (liquidez bloqueada, freeze/mint authority)");
-console.log("   • Top 10 holders < 30%");
-console.log("   • Anti-honeypot");
-console.log("   • Liquidez mínima: $20,000");
-console.log("   • Volatilidad mínima: 5%");
-console.log("   • Tokens sin datos RugCheck: RECHAZADOS");
-console.log("   • Errores RugCheck: RECHAZADOS");
+console.log("✅ Filtros activos: RugCheck | Holders <30% | Liquidez $20k");
+console.log("✅ Servidor HTTP activo (para Render)");
 console.log("✅ Sistema de autoreconexión: ACTIVADO");
-console.log("✅ Sistema de fallback: Birdeye → DexScreener");
-console.log("✅ Botones interactivos en Telegram");
 console.log("=".repeat(50) + "\n");
 
-// Iniciar el bot con sistema de autoreconexión
 startBotWithRetry();
 
-// Ejecutar escaneo inicial después de que el bot conecte
 setTimeout(() => {
     if (isPollingRunning) {
         scanMemecoins();
+        setInterval(scanMemecoins, 120000);
     } else {
-        console.log('⏳ Esperando conexión del bot para iniciar escaneo...');
-        const waitForConnection = setInterval(() => {
+        console.log('⏳ Esperando conexión...');
+        const checkInterval = setInterval(() => {
             if (isPollingRunning) {
-                clearInterval(waitForConnection);
+                clearInterval(checkInterval);
                 scanMemecoins();
+                setInterval(scanMemecoins, 600000);
             }
-        }, 1000);
+        }, 5000);
     }
-}, 2000);
-
-// Escanear cada 2 minutos (solo si el bot está conectado)
-setInterval(() => {
-    if (isPollingRunning) {
-        scanMemecoins();
-    } else {
-        console.log('⏳ Bot desconectado, omitiendo escaneo programado...');
-    }
-}, 600000);
+}, 5000);
