@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: hunternode
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node hunterbot.js
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: BIRDEYE_API_KEY
+        sync: false
